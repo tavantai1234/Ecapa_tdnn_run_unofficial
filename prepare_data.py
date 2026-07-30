@@ -45,12 +45,11 @@ import re
 import shutil
 from pathlib import Path
 
-import soundfile as sf
+import soundfile as sfgit 
 
 
 # ======================== CONFIG ========================
-
-PROJECT_ROOT = Path("/Users/tavantai/Developer/project_thesis_code")
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 # This is the output directory created by preprocess_e0.py.
 DATASET_ROOT = PROJECT_ROOT / "processed" / "E0"

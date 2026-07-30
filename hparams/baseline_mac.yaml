@@ -1,13 +1,13 @@
-# Baseline E0 for macOS / Apple MPS
+# Baseline E0 for MPS, CUDA, or CPU
 # Pretrained ECAPA-TDNN + fine-tuning
 # No VAD, no additive noise, no reverberation
 
 seed: 42
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
-# Run train_mac.py from the project root.
-manifest_folder: /Users/tavantai/Developer/project_thesis_code/manifests/E0
-output_folder: /Users/tavantai/Developer/project_thesis_code/results/E0
+# Run train.py from the project root.
+manifest_folder: ./manifests/E0
+output_folder: ./results/E0
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -19,7 +19,6 @@ out_n_neurons: 9
 
 sample_rate: 16000
 
-# Small defaults for the first Mac smoke test.
 number_of_epochs: 5
 batch_size: 4
 learning_rate: 0.0001

@@ -41,7 +41,7 @@ import torch
 import torchaudio.functional as AF
 
 
-PROJECT_ROOT = Path("/Users/tavantai/Developer/project_thesis_code")
+PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "new_data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "processed" / "E0"
 DEFAULT_SAMPLE_RATE = 16_000
