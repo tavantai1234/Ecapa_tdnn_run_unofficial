@@ -1,0 +1,106 @@
+# Baseline E0 for macOS / Apple MPS
+# Pretrained ECAPA-TDNN + fine-tuning
+# No VAD, no additive noise, no reverberation
+
+seed: 42
+__set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
+
+# Run train_mac.py from the project root.
+manifest_folder: /Users/tavantai/Developer/project_thesis_code/manifest
+output_folder: /Users/tavantai/Developer/project_thesis_code/results/E0
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+train_annotation: !ref <manifest_folder>/train.csv
+valid_annotation: !ref <manifest_folder>/dev.csv
+
+# Must equal the number of unique spk_id values in train.csv.
+out_n_neurons: 7
+
+sample_rate: 16000
+
+# Small defaults for the first Mac smoke test.
+number_of_epochs: 2
+batch_size: 4
+learning_rate: 0.0001
+num_workers: 0
+
+train_dataloader_options:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: !ref <num_workers>
+    pin_memory: False
+    drop_last: True
+
+valid_dataloader_options:
+    batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: !ref <num_workers>
+    pin_memory: False
+    drop_last: False
+
+n_mels: 80
+
+compute_features: !new:speechbrain.lobes.features.Fbank
+    n_mels: !ref <n_mels>
+
+mean_var_norm: !new:speechbrain.processing.features.InputNormalization
+    norm_type: sentence
+    std_norm: False
+
+# Must match speechbrain/spkrec-ecapa-voxceleb.
+embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
+    input_size: !ref <n_mels>
+    channels: [1024, 1024, 1024, 1024, 3072]
+    kernel_sizes: [5, 3, 3, 3, 1]
+    dilations: [1, 2, 3, 4, 1]
+    attention_channels: 128
+    lin_neurons: 192
+
+# New classifier for speakers in train.csv.
+classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
+    input_size: 192
+    out_neurons: !ref <out_n_neurons>
+
+modules:
+    compute_features: !ref <compute_features>
+    mean_var_norm: !ref <mean_var_norm>
+    embedding_model: !ref <embedding_model>
+    classifier: !ref <classifier>
+
+compute_cost: !new:speechbrain.nnet.losses.LogSoftmaxWrapper
+    loss_fn: !new:speechbrain.nnet.losses.AdditiveAngularMargin
+        margin: 0.2
+        scale: 30
+
+error_stats: !name:speechbrain.utils.metric_stats.MetricStats
+    metric: !name:speechbrain.nnet.losses.classification_error
+        reduction: batch
+
+opt_class: !name:torch.optim.Adam
+    lr: !ref <learning_rate>
+    weight_decay: 0.000002
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        embedding_model: !ref <embedding_model>
+        classifier: !ref <classifier>
+        normalizer: !ref <mean_var_norm>
+        counter: !ref <epoch_counter>
+
+pretrained_folder: !ref <output_folder>/pretrained
+
+# Load the pretrained encoder only.
+pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
+    collect_in: !ref <pretrained_folder>
+    loadables:
+        embedding_model: !ref <embedding_model>
+    paths:
+        embedding_model: speechbrain/spkrec-ecapa-voxceleb/embedding_model.ckpt

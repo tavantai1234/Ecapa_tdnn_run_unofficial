@@ -1,0 +1,4 @@
+results/
+dataset_copy/
+*.ckpt
+*.wav

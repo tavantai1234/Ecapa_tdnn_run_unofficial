@@ -1,0 +1,9 @@
+# Core framework
+speechbrain==1.1.0
+
+# PyTorch audio stack
+torch
+torchaudio
+
+# Audio metadata/loading used by prepare.py
+soundfile

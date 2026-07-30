@@ -1,0 +1,9 @@
+# PyTorch for macOS / Apple MPS
+torch
+torchaudio
+
+# SpeechBrain with the official MPS device-handling fix
+speechbrain @ git+https://github.com/speechbrain/speechbrain.git@8a89eba
+
+# Audio reading and metadata used by prepare.py
+soundfile
