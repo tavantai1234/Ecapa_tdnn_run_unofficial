@@ -45,7 +45,7 @@ import re
 import shutil
 from pathlib import Path
 
-import soundfile as sfgit 
+import soundfile as sf
 
 
 # ======================== CONFIG ========================
