@@ -52,10 +52,10 @@ import soundfile as sf
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # This is the output directory created by preprocess_e0.py.
-DATASET_ROOT = PROJECT_ROOT / "processed" / "E0"
+DATASET_ROOT = PROJECT_ROOT / "processed"
 
 # Keep E0 manifests separate from later E1/E2 experiments.
-OUTPUT_DIR = PROJECT_ROOT / "manifests" / "E0"
+OUTPUT_DIR = PROJECT_ROOT / "manifests"
 
 SAMPLE_RATE = 16_000
 
