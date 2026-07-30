@@ -43,7 +43,7 @@ import torchaudio.functional as AF
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "new_data"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "processed" / "E0"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "processed"
 DEFAULT_SAMPLE_RATE = 16_000
 SUPPORTED_EXTENSIONS = {".wav", ".flac", ".ogg", ".aiff", ".aif"}
 
