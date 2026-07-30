@@ -33,10 +33,12 @@ Results are written to:
 
 Usage
 -----
-    python test_e0.py hparams/baseline_mac.yaml
+    python test_e0.py hparams/baseline.yaml
 
-Force CPU:
-    python test_e0.py hparams/baseline_mac.yaml --device cpu
+The default is automatic: MPS -> CUDA -> CPU.
+
+Force a device:
+    python test_e0.py hparams/baseline.yaml --device cuda
 """
 
 from __future__ import annotations
@@ -79,13 +81,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "hparams_file",
         type=Path,
-        help="Training HyperPyYAML file, e.g. hparams/baseline_mac.yaml",
+        help="Training HyperPyYAML file, e.g. hparams/baseline.yaml",
     )
     parser.add_argument(
         "--device",
-        default="mps",
-        choices=["mps", "cpu", "cuda"],
-        help="Evaluation device. Default: mps",
+        default="auto",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Device selection. Default: auto (MPS -> CUDA -> CPU)",
     )
     parser.add_argument(
         "--enrol-csv",
@@ -180,21 +182,30 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--c-miss and --c-fa must be greater than 0.")
 
 
-def validate_device(device_name: str) -> torch.device:
+def select_device(device_name: str) -> torch.device:
+    """Select MPS first, then CUDA, and finally CPU when using auto."""
+    if device_name == "auto":
+        mps_backend = getattr(torch.backends, "mps", None)
+
+        if mps_backend is not None and mps_backend.is_available():
+            device_name = "mps"
+        elif torch.cuda.is_available():
+            device_name = "cuda"
+        else:
+            device_name = "cpu"
+
     if device_name == "mps":
-        if not torch.backends.mps.is_built():
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not mps_backend.is_built():
             raise RuntimeError(
                 "This PyTorch installation was not built with MPS support."
             )
-        if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "MPS is unavailable. Run with '--device cpu' or check "
-                "the macOS/PyTorch installation."
-            )
+        if not mps_backend.is_available():
+            raise RuntimeError("MPS was requested but is unavailable.")
 
     if device_name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA is unavailable. Run with '--device cpu' or '--device mps'."
+            "CUDA was requested but no CUDA GPU is available."
         )
 
     return torch.device(device_name)
@@ -889,7 +900,7 @@ def main() -> int:
     args = parse_args()
     validate_args(args)
 
-    device = validate_device(args.device)
+    device = select_device(args.device)
     hparams_file, hparams = load_hparams(args.hparams_file)
 
     enrol_csv, test_csv, trials_path, output_dir = derive_paths(
