@@ -55,7 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_ROOT = PROJECT_ROOT / "processed"
 
 # Keep E0 manifests separate from later E1/E2 experiments.
-OUTPUT_DIR = PROJECT_ROOT / "manifests"
+OUTPUT_DIR = PROJECT_ROOT / "manifests" / "E0"
 
 SAMPLE_RATE = 16_000
 
