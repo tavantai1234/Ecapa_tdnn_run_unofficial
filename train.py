@@ -222,9 +222,7 @@ if __name__ == "__main__":
     # Load only the pretrained ECAPA encoder.
     # The VoxCeleb classifier is intentionally not loaded.
     run_on_main(hparams["pretrainer"].collect_files)
-    hparams["pretrainer"].load_collected(
-        device=run_opts["device"]
-    )
+    hparams["pretrainer"].load_collected()
 
     brain = SpeakerBrain(
         modules=hparams["modules"],
