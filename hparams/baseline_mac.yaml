@@ -6,7 +6,7 @@ seed: 42
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
 # Run train_mac.py from the project root.
-manifest_folder: /Users/tavantai/Developer/project_thesis_code/manifest
+manifest_folder: /Users/tavantai/Developer/project_thesis_code/manifests/E0
 output_folder: /Users/tavantai/Developer/project_thesis_code/results/E0
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
@@ -15,12 +15,12 @@ train_annotation: !ref <manifest_folder>/train.csv
 valid_annotation: !ref <manifest_folder>/dev.csv
 
 # Must equal the number of unique spk_id values in train.csv.
-out_n_neurons: 7
+out_n_neurons: 9
 
 sample_rate: 16000
 
 # Small defaults for the first Mac smoke test.
-number_of_epochs: 2
+number_of_epochs: 5
 batch_size: 4
 learning_rate: 0.0001
 num_workers: 0
