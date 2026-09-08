@@ -7,7 +7,9 @@ __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
 # Run train.py from the project root.
 manifest_folder: ./manifests/E0
-output_folder: ./results/E0
+
+# Use a new folder because the epoch-counter format differs from old runs.
+output_folder: ./results/E0_early_stopping
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -19,7 +21,11 @@ out_n_neurons: 9
 
 sample_rate: 16000
 
-number_of_epochs: 5
+# number_of_epochs is the maximum. Training may stop earlier.
+number_of_epochs: 30
+early_stopping_patience: 5
+early_stopping_warmup: 2
+
 batch_size: 4
 learning_rate: 0.0001
 num_workers: 0
@@ -80,8 +86,11 @@ opt_class: !name:torch.optim.Adam
     lr: !ref <learning_rate>
     weight_decay: 0.000002
 
-epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounterWithStopper
     limit: !ref <number_of_epochs>
+    limit_to_stop: !ref <early_stopping_patience>
+    limit_warmup: !ref <early_stopping_warmup>
+    direction: min
 
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
