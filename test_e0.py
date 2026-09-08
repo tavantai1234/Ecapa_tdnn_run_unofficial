@@ -722,10 +722,10 @@ def calculate_threshold_stats(
     threshold: float,
 ) -> dict[str, float | int]:
     false_rejects = int(
-        (positive_scores < threshold).sum().item()
+        (positive_scores <= threshold).sum().item()
     )
     false_accepts = int(
-        (negative_scores >= threshold).sum().item()
+        (negative_scores > threshold).sum().item()
     )
 
     genuine_count = int(positive_scores.numel())
@@ -761,7 +761,7 @@ def write_scores(
         writer.writeheader()
 
         for row in score_rows:
-            prediction = int(row["score"] >= threshold)
+            prediction = int(row["score"] > threshold)
             writer.writerow(
                 {
                     **row,
