@@ -1,397 +1,251 @@
 #!/usr/bin/env python3
-"""Prepare SpeechBrain manifests for the ECAPA-TDNN baseline E0.
+"""Create SpeechBrain manifests from separate train/validation and test data.
 
-Input
------
-Audio processed by ``preprocess_e0.py``:
+Examples
+--------
+Train/validation manifests:
 
-    processed/E0/
-        speaker_01/*.wav
-        speaker_02/*.wav
-        ...
+    python prepare_data.py train \
+        --data-root processed/train_val \
+        --output-dir manifests/train_val
 
-Every input recording must already be:
-- mono;
-- 16 kHz;
-- otherwise kept at its original duration.
+External verification manifests:
 
-Output
-------
-    manifests/E0/
-        train.csv
-        dev.csv
-        enrol.csv
-        test.csv
-        verification_trials.txt
-        recording_split.csv
+    python prepare_data.py test \
+        --data-root processed/external_test \
+        --output-dir manifests/external_test
 
-Important design
-----------------
-1. Speakers are divided into training speakers and unseen verification speakers.
-2. Original recordings are assigned to train/dev or enrol/test BEFORE chunking.
-3. Train/dev recordings are represented by chunks using CSV ``start``/``stop``.
-4. No chunk WAV files are created.
-5. Residual train/dev chunks from 1.5 to under 3 seconds are retained. SpeechBrain
-   pads them when creating a batch.
-6. Enrol/test rows represent complete, mutually disjoint recordings. This keeps
-   verification trials at the utterance/recording level.
+Each top-level directory below --data-root is treated as one speaker.
+Input recordings must already be mono and have the requested sample rate.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import random
 import re
-import shutil
+import sys
 from pathlib import Path
 
 import soundfile as sf
 
 
-# ======================== CONFIG ========================
-PROJECT_ROOT = Path(__file__).resolve().parent
-
-# This is the output directory created by preprocess_e0.py.
-DATASET_ROOT = PROJECT_ROOT / "processed"
-
-# Keep E0 manifests separate from later E1/E2 experiments.
-OUTPUT_DIR = PROJECT_ROOT / "manifests" / "E0"
-
-SAMPLE_RATE = 16_000
-
-# Train/dev chunk configuration.
-CHUNK_SECONDS = 3.0
-MIN_CHUNK_SECONDS = 1.5
-
-# Recording-level split ratio for every training speaker.
-DEV_RATIO = 0.10
-
-NUM_VERIFICATION_SPEAKERS = 2
-ENROL_RECORDINGS_PER_SPEAKER = 5
-
-# Verification recordings shorter than this are ignored.
-MIN_VERIFICATION_SECONDS = 1.5
-
-# None: choose verification speakers reproducibly using SEED.
-# Example: ["speaker_06", "speaker_07"]
-VERIFICATION_SPEAKERS = None
-
-SEED = 42
+DEFAULT_SAMPLE_RATE = 16_000
+DEFAULT_SEED = 42
+DEFAULT_DEV_RATIO = 0.10
+DEFAULT_CHUNK_SECONDS = 3.0
+DEFAULT_MIN_CHUNK_SECONDS = 1.5
+DEFAULT_ENROL_COUNT = 5
+DEFAULT_MIN_VERIFICATION_SECONDS = 1.5
 AUDIO_EXTENSIONS = {".wav", ".flac"}
 
-
-MANIFEST_COLUMNS = [
-    "ID",
-    "duration",
-    "wav",
-    "start",
-    "stop",
+MANIFEST_COLUMNS = ["ID", "duration", "wav", "start", "stop", "spk_id"]
+AUDIT_COLUMNS = [
+    "recording_id",
+    "relative_path",
     "spk_id",
+    "split",
+    "duration",
+    "frames",
 ]
 
 
-# ======================== FILESYSTEM ========================
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        required=True,
+        help="Processed data root; each top-level directory is one speaker.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory in which manifest files are written.",
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=DEFAULT_SAMPLE_RATE,
+    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite only manifest files produced by this command.",
+    )
 
-def reset_output_dir() -> None:
-    """Safely recreate only ``manifests/E0``."""
-    output_dir = OUTPUT_DIR.expanduser().resolve()
 
-    if output_dir.name != "E0" or output_dir.parent.name != "manifests":
-        raise ValueError(
-            "Safety check failed: OUTPUT_DIR must point to "
-            "'.../manifests/E0'."
-        )
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Prepare train/dev or external verification manifests."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
+    train_parser = commands.add_parser(
+        "train",
+        help="Create train.csv and dev.csv.",
+    )
+    add_common_arguments(train_parser)
+    train_parser.add_argument(
+        "--dev-ratio",
+        type=float,
+        default=DEFAULT_DEV_RATIO,
+    )
+    train_parser.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=DEFAULT_CHUNK_SECONDS,
+    )
+    train_parser.add_argument(
+        "--min-chunk-seconds",
+        type=float,
+        default=DEFAULT_MIN_CHUNK_SECONDS,
+    )
 
-    output_dir.mkdir(parents=True, exist_ok=False)
+    test_parser = commands.add_parser(
+        "test",
+        help="Create enrol.csv, test.csv, and verification_trials.txt.",
+    )
+    add_common_arguments(test_parser)
+    test_parser.add_argument(
+        "--enrol-recordings-per-speaker",
+        type=int,
+        default=DEFAULT_ENROL_COUNT,
+    )
+    test_parser.add_argument(
+        "--min-verification-seconds",
+        type=float,
+        default=DEFAULT_MIN_VERIFICATION_SECONDS,
+    )
+    test_parser.add_argument(
+        "--all-impostor-trials",
+        action="store_true",
+        help="Keep all different-speaker trials instead of balancing them.",
+    )
+    test_parser.add_argument(
+        "--train-csv",
+        type=Path,
+        default=None,
+        help="Optional train.csv used to check speaker disjointness.",
+    )
+    return parser.parse_args()
 
 
-# ======================== AUDIO SCAN ========================
+def validate_args(args: argparse.Namespace) -> None:
+    if args.sample_rate <= 0:
+        raise ValueError("--sample-rate must be greater than zero.")
 
-def safe_id(path: Path) -> str:
-    """Create a stable ID from the path relative to DATASET_ROOT."""
-    relative = path.relative_to(DATASET_ROOT).with_suffix("")
-    raw = "--".join(relative.parts)
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", raw)
+    if args.command == "train":
+        if not 0.0 < args.dev_ratio < 1.0:
+            raise ValueError("--dev-ratio must be between 0 and 1.")
+        if args.chunk_seconds <= 0 or args.min_chunk_seconds <= 0:
+            raise ValueError("Chunk durations must be greater than zero.")
+        if args.min_chunk_seconds > args.chunk_seconds:
+            raise ValueError(
+                "--min-chunk-seconds cannot exceed --chunk-seconds."
+            )
+    else:
+        if args.enrol_recordings_per_speaker < 1:
+            raise ValueError(
+                "--enrol-recordings-per-speaker must be at least 1."
+            )
+        if args.min_verification_seconds <= 0:
+            raise ValueError(
+                "--min-verification-seconds must be greater than zero."
+            )
 
 
-def read_audio_info(path: Path) -> dict:
-    """Read and validate one processed recording."""
+def safe_id(path: Path, data_root: Path) -> str:
+    relative = path.relative_to(data_root).with_suffix("")
+    return re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        "--".join(relative.parts),
+    )
+
+
+def read_audio_info(
+    path: Path,
+    data_root: Path,
+    sample_rate: int,
+) -> dict:
     info = sf.info(str(path))
-
-    if info.samplerate != SAMPLE_RATE:
+    if info.samplerate != sample_rate:
         raise ValueError(
-            f"{path}: expected {SAMPLE_RATE} Hz, got {info.samplerate} Hz"
+            f"{path}: expected {sample_rate} Hz, got {info.samplerate} Hz"
         )
-
     if info.channels != 1:
         raise ValueError(
             f"{path}: expected mono audio, got {info.channels} channels"
         )
-
     if info.frames <= 0:
         raise ValueError(f"{path}: audio contains no frames")
 
-    relative_path = path.relative_to(DATASET_ROOT)
-    speaker_id = relative_path.parts[0]
-
+    relative_path = path.relative_to(data_root)
     return {
         "path": path.resolve(),
         "relative_path": relative_path.as_posix(),
-        "recording_id": safe_id(path),
-        "spk_id": speaker_id,
+        "recording_id": safe_id(path, data_root),
+        "spk_id": relative_path.parts[0],
         "frames": int(info.frames),
         "duration": float(info.frames / info.samplerate),
     }
 
 
-def scan_dataset() -> dict[str, list[dict]]:
-    """Scan one top-level directory per speaker."""
-    if not DATASET_ROOT.is_dir():
-        raise FileNotFoundError(
-            f"Processed dataset not found: {DATASET_ROOT}\n"
-            "Run preprocess_e0.py first."
-        )
+def scan_dataset(
+    data_root: Path,
+    sample_rate: int,
+) -> dict[str, list[dict]]:
+    data_root = data_root.expanduser().resolve()
+    if not data_root.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {data_root}")
 
     speakers: dict[str, list[dict]] = {}
+    seen_ids: dict[str, Path] = {}
 
-    for speaker_dir in sorted(DATASET_ROOT.iterdir()):
+    for speaker_dir in sorted(data_root.iterdir()):
         if not speaker_dir.is_dir():
             continue
 
+        recordings = []
         paths = sorted(
             path
             for path in speaker_dir.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in AUDIO_EXTENSIONS
+            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
         )
+        for path in paths:
+            recording = read_audio_info(path, data_root, sample_rate)
+            recording_id = recording["recording_id"]
+            if recording_id in seen_ids:
+                raise ValueError(
+                    "Recording ID collision: "
+                    f"{seen_ids[recording_id]} and {path}"
+                )
+            seen_ids[recording_id] = path
+            recordings.append(recording)
 
-        if paths:
-            speakers[speaker_dir.name] = [
-                read_audio_info(path) for path in paths
-            ]
+        if recordings:
+            speakers[speaker_dir.name] = recordings
 
-    if len(speakers) < NUM_VERIFICATION_SPEAKERS + 1:
-        raise ValueError(
-            "At least one training speaker and "
-            f"{NUM_VERIFICATION_SPEAKERS} verification speakers are required."
-        )
-
+    if not speakers:
+        raise ValueError(f"No speaker audio found under: {data_root}")
     return speakers
 
 
-# ======================== SPEAKER SPLIT ========================
-
-def training_eligible(recording: dict) -> bool:
-    """Whether a recording can produce at least one retained chunk."""
-    return recording["duration"] >= MIN_CHUNK_SECONDS
-
-
-def verification_eligible(recording: dict) -> bool:
-    """Whether a recording is long enough for enrol/test."""
-    return recording["duration"] >= MIN_VERIFICATION_SECONDS
-
-
-def choose_speakers(
-    speakers: dict[str, list[dict]],
-    rng: random.Random,
-) -> tuple[list[str], list[str]]:
-    """Create disjoint training and unseen verification speaker groups."""
-    required_verification_recordings = ENROL_RECORDINGS_PER_SPEAKER + 1
-
-    eligible_verification_speakers = sorted(
-        speaker_id
-        for speaker_id, recordings in speakers.items()
-        if sum(
-            verification_eligible(recording)
-            for recording in recordings
-        )
-        >= required_verification_recordings
-    )
-
-    if VERIFICATION_SPEAKERS is None:
-        if (
-            len(eligible_verification_speakers)
-            < NUM_VERIFICATION_SPEAKERS
-        ):
-            raise ValueError(
-                "Not enough speakers have sufficient recordings for "
-                "enrol/test."
-            )
-
-        verification_speakers = sorted(
-            rng.sample(
-                eligible_verification_speakers,
-                NUM_VERIFICATION_SPEAKERS,
-            )
-        )
-    else:
-        verification_speakers = sorted(VERIFICATION_SPEAKERS)
-
-        if (
-            len(verification_speakers)
-            != NUM_VERIFICATION_SPEAKERS
-        ):
-            raise ValueError(
-                "VERIFICATION_SPEAKERS length must equal "
-                "NUM_VERIFICATION_SPEAKERS."
-            )
-
-        unknown = set(verification_speakers) - set(speakers)
-        if unknown:
-            raise ValueError(
-                f"Unknown verification speakers: {sorted(unknown)}"
-            )
-
-        insufficient = [
-            speaker_id
-            for speaker_id in verification_speakers
-            if sum(
-                verification_eligible(recording)
-                for recording in speakers[speaker_id]
-            )
-            < required_verification_recordings
-        ]
-        if insufficient:
-            raise ValueError(
-                "Verification speakers do not have enough eligible "
-                f"recordings: {insufficient}"
-            )
-
-    training_speakers = sorted(
-        set(speakers) - set(verification_speakers)
-    )
-
-    return training_speakers, verification_speakers
+def audit_row(recording: dict, split: str) -> dict:
+    return {
+        "recording_id": recording["recording_id"],
+        "relative_path": recording["relative_path"],
+        "spk_id": recording["spk_id"],
+        "split": split,
+        "duration": round(recording["duration"], 6),
+        "frames": recording["frames"],
+    }
 
 
-# ======================== CHUNK CREATION ========================
-
-def make_chunk_rows(
-    recordings: list[dict],
-    speaker_id: str,
-) -> list[dict]:
-    """Create train/dev CSV rows without writing physical chunk files."""
-    chunk_frames = int(round(CHUNK_SECONDS * SAMPLE_RATE))
-    min_chunk_frames = int(round(MIN_CHUNK_SECONDS * SAMPLE_RATE))
-
-    rows: list[dict] = []
-
-    for recording in recordings:
-        total_frames = recording["frames"]
-        segment_index = 0
-        start = 0
-
-        while start < total_frames:
-            remaining = total_frames - start
-
-            if remaining >= chunk_frames:
-                stop = start + chunk_frames
-            elif remaining >= min_chunk_frames:
-                # Retain the final short chunk. PaddedBatch will pad it later.
-                stop = total_frames
-            else:
-                # Discard a residual shorter than MIN_CHUNK_SECONDS.
-                break
-
-            duration = (stop - start) / SAMPLE_RATE
-
-            rows.append(
-                {
-                    "ID": (
-                        f"{recording['recording_id']}"
-                        f"--seg{segment_index:04d}"
-                    ),
-                    "duration": round(duration, 6),
-                    "wav": str(recording["path"]),
-                    "start": start,
-                    "stop": stop,
-                    "spk_id": speaker_id,
-                    # Internal field for leakage validation.
-                    "_recording_id": recording["recording_id"],
-                }
-            )
-
-            segment_index += 1
-            start = stop
-
-    return rows
-
-
-# ======================== RECORDING SPLITS ========================
-
-def split_train_dev(
-    speakers: dict[str, list[dict]],
-    training_speakers: list[str],
-    rng: random.Random,
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """
-    Split complete recordings first, then create train/dev chunks.
-
-    Returns:
-        train chunk rows,
-        dev chunk rows,
-        recording-level audit rows.
-    """
-    train_rows: list[dict] = []
-    dev_rows: list[dict] = []
-    audit_rows: list[dict] = []
-
-    for speaker_id in training_speakers:
-        eligible = [
-            recording
-            for recording in speakers[speaker_id]
-            if training_eligible(recording)
-        ]
-
-        if len(eligible) < 2:
-            raise ValueError(
-                f"{speaker_id} needs at least two recordings of "
-                f"{MIN_CHUNK_SECONDS} seconds or longer for train/dev."
-            )
-
-        rng.shuffle(eligible)
-
-        num_dev = max(1, round(len(eligible) * DEV_RATIO))
-        num_dev = min(num_dev, len(eligible) - 1)
-
-        dev_recordings = eligible[:num_dev]
-        train_recordings = eligible[num_dev:]
-
-        speaker_train_rows = make_chunk_rows(
-            train_recordings,
-            speaker_id,
-        )
-        speaker_dev_rows = make_chunk_rows(
-            dev_recordings,
-            speaker_id,
-        )
-
-        if not speaker_train_rows or not speaker_dev_rows:
-            raise ValueError(
-                f"Could not create both train and dev chunks for "
-                f"{speaker_id}."
-            )
-
-        train_rows.extend(speaker_train_rows)
-        dev_rows.extend(speaker_dev_rows)
-
-        audit_rows.extend(
-            make_recording_audit_row(recording, "train")
-            for recording in train_recordings
-        )
-        audit_rows.extend(
-            make_recording_audit_row(recording, "dev")
-            for recording in dev_recordings
-        )
-
-    return train_rows, dev_rows, audit_rows
-
-
-def make_full_recording_row(recording: dict) -> dict:
-    """Create one enrol/test row for a complete recording."""
+def full_recording_row(recording: dict) -> dict:
     return {
         "ID": recording["recording_id"],
         "duration": round(recording["duration"], 6),
@@ -403,88 +257,173 @@ def make_full_recording_row(recording: dict) -> dict:
     }
 
 
-def split_enrol_test(
+def make_chunk_rows(
+    recordings: list[dict],
+    speaker_id: str,
+    sample_rate: int,
+    chunk_seconds: float,
+    min_chunk_seconds: float,
+) -> list[dict]:
+    chunk_frames = int(round(chunk_seconds * sample_rate))
+    min_chunk_frames = int(round(min_chunk_seconds * sample_rate))
+    rows: list[dict] = []
+
+    for recording in recordings:
+        start = 0
+        segment_index = 0
+        while start < recording["frames"]:
+            remaining = recording["frames"] - start
+            if remaining >= chunk_frames:
+                stop = start + chunk_frames
+            elif remaining >= min_chunk_frames:
+                stop = recording["frames"]
+            else:
+                break
+
+            rows.append(
+                {
+                    "ID": (
+                        f"{recording['recording_id']}"
+                        f"--seg{segment_index:04d}"
+                    ),
+                    "duration": round((stop - start) / sample_rate, 6),
+                    "wav": str(recording["path"]),
+                    "start": start,
+                    "stop": stop,
+                    "spk_id": speaker_id,
+                    "_recording_id": recording["recording_id"],
+                }
+            )
+            segment_index += 1
+            start = stop
+    return rows
+
+
+def split_train_dev(
     speakers: dict[str, list[dict]],
-    verification_speakers: list[str],
+    args: argparse.Namespace,
     rng: random.Random,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """Split complete recordings into mutually disjoint enrol/test sets."""
-    eligible_by_speaker = {
-        speaker_id: [
+    """Split complete recordings per speaker before making chunks."""
+    train_rows: list[dict] = []
+    dev_rows: list[dict] = []
+    audit_rows: list[dict] = []
+
+    for speaker_id in sorted(speakers):
+        eligible = [
             recording
             for recording in speakers[speaker_id]
-            if verification_eligible(recording)
+            if recording["duration"] >= args.min_chunk_seconds
         ]
-        for speaker_id in verification_speakers
-    }
+        if len(eligible) < 2:
+            raise ValueError(
+                f"{speaker_id} needs at least two recordings of "
+                f"{args.min_chunk_seconds} seconds or longer for train/dev."
+            )
 
-    balanced_count = min(
-        len(recordings)
-        for recordings in eligible_by_speaker.values()
-    )
+        rng.shuffle(eligible)
+        num_dev = max(1, round(len(eligible) * args.dev_ratio))
+        num_dev = min(num_dev, len(eligible) - 1)
+        dev_recordings = eligible[:num_dev]
+        train_recordings = eligible[num_dev:]
 
-    if balanced_count <= ENROL_RECORDINGS_PER_SPEAKER:
+        speaker_train_rows = make_chunk_rows(
+            train_recordings,
+            speaker_id,
+            args.sample_rate,
+            args.chunk_seconds,
+            args.min_chunk_seconds,
+        )
+        speaker_dev_rows = make_chunk_rows(
+            dev_recordings,
+            speaker_id,
+            args.sample_rate,
+            args.chunk_seconds,
+            args.min_chunk_seconds,
+        )
+        if not speaker_train_rows or not speaker_dev_rows:
+            raise ValueError(
+                f"Could not create train and dev chunks for {speaker_id}."
+            )
+
+        train_rows.extend(speaker_train_rows)
+        dev_rows.extend(speaker_dev_rows)
+        audit_rows.extend(
+            audit_row(recording, "train")
+            for recording in train_recordings
+        )
+        audit_rows.extend(
+            audit_row(recording, "dev")
+            for recording in dev_recordings
+        )
+
+    return train_rows, dev_rows, audit_rows
+
+
+def split_enrol_test(
+    speakers: dict[str, list[dict]],
+    args: argparse.Namespace,
+    rng: random.Random,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split complete external-test recordings into enrol and test."""
+    if len(speakers) < 2:
         raise ValueError(
-            "Verification speakers need more eligible recordings than "
-            "ENROL_RECORDINGS_PER_SPEAKER."
+            "External verification requires at least two speakers."
         )
 
     enrol_rows: list[dict] = []
     test_rows: list[dict] = []
     audit_rows: list[dict] = []
+    required = args.enrol_recordings_per_speaker + 1
 
-    for speaker_id in verification_speakers:
-        selected = list(eligible_by_speaker[speaker_id])
-        rng.shuffle(selected)
-        selected = selected[:balanced_count]
+    for speaker_id in sorted(speakers):
+        eligible = [
+            recording
+            for recording in speakers[speaker_id]
+            if recording["duration"] >= args.min_verification_seconds
+        ]
+        if len(eligible) < required:
+            raise ValueError(
+                f"{speaker_id} has {len(eligible)} eligible recording(s), "
+                f"but needs at least {required}: "
+                f"{args.enrol_recordings_per_speaker} enrol + 1 test."
+            )
 
-        enrol_recordings = selected[:ENROL_RECORDINGS_PER_SPEAKER]
-        test_recordings = selected[ENROL_RECORDINGS_PER_SPEAKER:]
+        rng.shuffle(eligible)
+        enrol_recordings = eligible[
+            : args.enrol_recordings_per_speaker
+        ]
+        test_recordings = eligible[
+            args.enrol_recordings_per_speaker :
+        ]
 
         enrol_rows.extend(
-            make_full_recording_row(recording)
+            full_recording_row(recording)
             for recording in enrol_recordings
         )
         test_rows.extend(
-            make_full_recording_row(recording)
+            full_recording_row(recording)
             for recording in test_recordings
         )
-
         audit_rows.extend(
-            make_recording_audit_row(recording, "enrol")
+            audit_row(recording, "enrol")
             for recording in enrol_recordings
         )
         audit_rows.extend(
-            make_recording_audit_row(recording, "test")
+            audit_row(recording, "test")
             for recording in test_recordings
         )
 
     return enrol_rows, test_rows, audit_rows
 
 
-def make_recording_audit_row(
-    recording: dict,
-    split: str,
-) -> dict:
-    """Create one row showing the recording-level assignment."""
-    return {
-        "recording_id": recording["recording_id"],
-        "relative_path": recording["relative_path"],
-        "spk_id": recording["spk_id"],
-        "split": split,
-        "duration": round(recording["duration"], 6),
-        "frames": recording["frames"],
-    }
-
-
-# ======================== VERIFICATION TRIALS ========================
-
 def create_trials(
     enrol_rows: list[dict],
     test_rows: list[dict],
     rng: random.Random,
+    all_impostor_trials: bool,
 ) -> list[tuple[int, str, str]]:
-    """Create balanced genuine and impostor recording-level trials."""
+    """Create genuine and impostor recording-level trials."""
     genuine: list[tuple[int, str, str]] = []
     impostor: list[tuple[int, str, str]] = []
 
@@ -492,7 +431,6 @@ def create_trials(
         for test in test_rows:
             label = int(enrol["spk_id"] == test["spk_id"])
             trial = (label, enrol["ID"], test["ID"])
-
             if label == 1:
                 genuine.append(trial)
             else:
@@ -500,128 +438,182 @@ def create_trials(
 
     if not genuine or not impostor:
         raise ValueError(
-            "Verification trials need both genuine and impostor pairs."
+            "Verification trials need genuine and impostor pairs."
         )
 
-    rng.shuffle(impostor)
-    impostor = impostor[:len(genuine)]
+    if not all_impostor_trials:
+        rng.shuffle(impostor)
+        impostor = impostor[: len(genuine)]
 
     trials = genuine + impostor
     rng.shuffle(trials)
-
     return trials
 
 
-# ======================== VALIDATION ========================
+def read_speaker_ids(csv_path: Path) -> set[str]:
+    csv_path = csv_path.expanduser().resolve()
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Training manifest not found: {csv_path}")
 
-def validate_manifest_row(row: dict, split_name: str) -> None:
-    start = int(row["start"])
-    stop = int(row["stop"])
-    duration = float(row["duration"])
+    with csv_path.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None or "spk_id" not in reader.fieldnames:
+            raise ValueError(f"{csv_path} has no spk_id column")
+        speaker_ids = {
+            row["spk_id"].strip()
+            for row in reader
+            if row["spk_id"].strip()
+        }
 
-    if start < 0:
-        raise ValueError(
-            f"{split_name}: negative start in {row['ID']}"
-        )
-    if stop <= start:
-        raise ValueError(
-            f"{split_name}: invalid start/stop in {row['ID']}"
-        )
-    if duration <= 0:
-        raise ValueError(
-            f"{split_name}: non-positive duration in {row['ID']}"
-        )
-
-    expected_duration = (stop - start) / SAMPLE_RATE
-    if abs(duration - expected_duration) > 1e-5:
-        raise ValueError(
-            f"{split_name}: duration disagrees with start/stop "
-            f"in {row['ID']}"
-        )
+    if not speaker_ids:
+        raise ValueError(f"No speaker IDs found in: {csv_path}")
+    return speaker_ids
 
 
-def validate_split(
-    train_rows: list[dict],
-    dev_rows: list[dict],
-    enrol_rows: list[dict],
-    test_rows: list[dict],
+def check_external_speakers(
+    test_speakers: set[str],
+    train_csv: Path | None,
 ) -> None:
-    """Check speaker separation, recording leakage, and duplicate IDs."""
-    split_rows = {
-        "train": train_rows,
-        "dev": dev_rows,
-        "enrol": enrol_rows,
-        "test": test_rows,
-    }
+    """Optionally verify train/test speaker-ID separation."""
+    if train_csv is None:
+        return
+
+    overlap = sorted(test_speakers & read_speaker_ids(train_csv))
+    if overlap:
+        raise ValueError(
+            "Training and external-test speaker IDs overlap: "
+            f"{overlap[:10]}"
+        )
+
+
+def validate_manifest_rows(
+    split_rows: dict[str, list[dict]],
+    sample_rate: int,
+) -> None:
+    all_ids: list[str] = []
 
     for split_name, rows in split_rows.items():
         if not rows:
             raise ValueError(f"{split_name}.csv would be empty")
 
-        ids = [row["ID"] for row in rows]
-        if len(ids) != len(set(ids)):
-            raise ValueError(
-                f"Duplicate IDs found inside {split_name}.csv"
-            )
+        split_ids = [row["ID"] for row in rows]
+        if len(split_ids) != len(set(split_ids)):
+            raise ValueError(f"Duplicate IDs inside {split_name}.csv")
+        all_ids.extend(split_ids)
 
         for row in rows:
-            validate_manifest_row(row, split_name)
+            start = int(row["start"])
+            stop = int(row["stop"])
+            duration = float(row["duration"])
+            if start < 0 or stop <= start or duration <= 0:
+                raise ValueError(
+                    f"Invalid manifest row in {split_name}: {row['ID']}"
+                )
 
-    all_ids = [
-        row["ID"]
-        for rows in split_rows.values()
-        for row in rows
-    ]
+            expected_duration = (stop - start) / sample_rate
+            if abs(duration - expected_duration) > 1e-5:
+                raise ValueError(
+                    f"Duration disagrees with start/stop in "
+                    f"{split_name}: {row['ID']}"
+                )
+
     if len(all_ids) != len(set(all_ids)):
         raise ValueError("Duplicate IDs found across manifest files")
 
+
+def validate_train_split(
+    train_rows: list[dict],
+    dev_rows: list[dict],
+    sample_rate: int,
+) -> None:
+    validate_manifest_rows(
+        {"train": train_rows, "dev": dev_rows},
+        sample_rate,
+    )
+
     train_speakers = {row["spk_id"] for row in train_rows}
     dev_speakers = {row["spk_id"] for row in dev_rows}
-    verification_speakers = {
-        row["spk_id"]
-        for row in enrol_rows + test_rows
-    }
-
     if train_speakers != dev_speakers:
         raise ValueError(
             "train.csv and dev.csv must contain the same speakers"
         )
 
-    if not train_speakers.isdisjoint(verification_speakers):
+    train_recordings = {row["_recording_id"] for row in train_rows}
+    dev_recordings = {row["_recording_id"] for row in dev_rows}
+    overlap = sorted(train_recordings & dev_recordings)
+    if overlap:
         raise ValueError(
-            "Training and verification speaker groups overlap"
-        )
-
-    train_recordings = {
-        row["_recording_id"] for row in train_rows
-    }
-    dev_recordings = {
-        row["_recording_id"] for row in dev_rows
-    }
-    enrol_recordings = {
-        row["_recording_id"] for row in enrol_rows
-    }
-    test_recordings = {
-        row["_recording_id"] for row in test_rows
-    }
-
-    if not train_recordings.isdisjoint(dev_recordings):
-        overlap = sorted(train_recordings & dev_recordings)
-        raise ValueError(
-            f"Recording leakage between train and dev: {overlap[:5]}"
-        )
-
-    if not enrol_recordings.isdisjoint(test_recordings):
-        overlap = sorted(enrol_recordings & test_recordings)
-        raise ValueError(
-            f"Recording leakage between enrol and test: {overlap[:5]}"
+            f"Recording leakage between train and dev: {overlap[:10]}"
         )
 
 
-# ======================== WRITING ========================
+def validate_test_split(
+    enrol_rows: list[dict],
+    test_rows: list[dict],
+    trials: list[tuple[int, str, str]],
+    sample_rate: int,
+) -> None:
+    validate_manifest_rows(
+        {"enrol": enrol_rows, "test": test_rows},
+        sample_rate,
+    )
+
+    enrol_speakers = {row["spk_id"] for row in enrol_rows}
+    test_speakers = {row["spk_id"] for row in test_rows}
+    if enrol_speakers != test_speakers:
+        raise ValueError(
+            "enrol.csv and test.csv must contain the same speakers"
+        )
+
+    enrol_recordings = {row["_recording_id"] for row in enrol_rows}
+    test_recordings = {row["_recording_id"] for row in test_rows}
+    overlap = sorted(enrol_recordings & test_recordings)
+    if overlap:
+        raise ValueError(
+            f"Recording leakage between enrol and test: {overlap[:10]}"
+        )
+
+    enrol_by_id = {row["ID"]: row for row in enrol_rows}
+    test_by_id = {row["ID"]: row for row in test_rows}
+    for label, enrol_id, test_id in trials:
+        if enrol_id not in enrol_by_id or test_id not in test_by_id:
+            raise ValueError(
+                f"Trial references unknown ID: {enrol_id}, {test_id}"
+            )
+        expected = int(
+            enrol_by_id[enrol_id]["spk_id"]
+            == test_by_id[test_id]["spk_id"]
+        )
+        if label != expected:
+            raise ValueError(
+                f"Incorrect trial label: {enrol_id}, {test_id}"
+            )
+
+
+def prepare_output_files(
+    output_dir: Path,
+    filenames: list[str],
+    overwrite: bool,
+) -> Path:
+    """Create output_dir without deleting it or unrelated files."""
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = [
+        output_dir / name
+        for name in filenames
+        if (output_dir / name).exists()
+    ]
+    if existing and not overwrite:
+        formatted = "\n".join(f"  {path}" for path in existing)
+        raise FileExistsError(
+            "Manifest files already exist. Use --overwrite to replace "
+            f"only these files:\n{formatted}"
+        )
+    return output_dir
+
 
 def write_csv(path: Path, rows: list[dict]) -> None:
-    """Write a SpeechBrain manifest without internal validation fields."""
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
@@ -632,22 +624,9 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def write_recording_split(
-    path: Path,
-    rows: list[dict],
-) -> None:
-    """Write a reproducibility/audit table at original-recording level."""
-    columns = [
-        "recording_id",
-        "relative_path",
-        "spk_id",
-        "split",
-        "duration",
-        "frames",
-    ]
-
+def write_audit(path: Path, rows: list[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=columns)
+        writer = csv.DictWriter(file, fieldnames=AUDIT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -656,138 +635,102 @@ def write_trials(
     path: Path,
     trials: list[tuple[int, str, str]],
 ) -> None:
-    """Write ``label enrol_id test_id``."""
     with path.open("w", encoding="utf-8") as file:
         for label, enrol_id, test_id in trials:
             file.write(f"{label} {enrol_id} {test_id}\n")
 
 
-# ======================== SUMMARY ========================
-
-def print_summary(
-    speakers: dict[str, list[dict]],
-    training_speakers: list[str],
-    verification_speakers: list[str],
-    train_rows: list[dict],
-    dev_rows: list[dict],
-    enrol_rows: list[dict],
-    test_rows: list[dict],
-    recording_split_rows: list[dict],
-    trials: list[tuple[int, str, str]],
-) -> None:
-    print("\nRecordings discovered per speaker:")
-    for speaker_id in sorted(speakers):
-        role = (
-            "verification"
-            if speaker_id in verification_speakers
-            else "training"
-        )
-        print(
-            f"  {speaker_id:<20} "
-            f"{len(speakers[speaker_id]):>4} recordings [{role}]"
-        )
-
-    split_recording_counts = {
-        split: sum(
-            row["split"] == split
-            for row in recording_split_rows
-        )
-        for split in ("train", "dev", "enrol", "test")
-    }
-
-    genuine_count = sum(label == 1 for label, _, _ in trials)
-    impostor_count = sum(label == 0 for label, _, _ in trials)
-
-    print("\nSpeaker split:")
-    print("  Training:    ", ", ".join(training_speakers))
-    print("  Verification:", ", ".join(verification_speakers))
-
-    print("\nRecording assignments:")
-    for split in ("train", "dev", "enrol", "test"):
-        print(
-            f"  {split:<6}: "
-            f"{split_recording_counts[split]} recordings"
-        )
-
-    print("\nGenerated manifests:")
-    print(f"  train.csv:               {len(train_rows)} chunks")
-    print(f"  dev.csv:                 {len(dev_rows)} chunks")
-    print(f"  enrol.csv:               {len(enrol_rows)} recordings")
-    print(f"  test.csv:                {len(test_rows)} recordings")
-    print(f"  verification_trials.txt: {len(trials)} trials")
-    print(f"    genuine:               {genuine_count}")
-    print(f"    impostor:              {impostor_count}")
-    print("  recording_split.csv:     recording-level audit")
-
-    print(f"\nSaved to: {OUTPUT_DIR}")
-
-
-# ======================== MAIN ========================
-
-def main() -> None:
-    rng = random.Random(SEED)
-
-    speakers = scan_dataset()
-    training_speakers, verification_speakers = choose_speakers(
+def run_train(args: argparse.Namespace) -> None:
+    rng = random.Random(args.seed)
+    speakers = scan_dataset(args.data_root, args.sample_rate)
+    train_rows, dev_rows, audit_rows = split_train_dev(
         speakers,
+        args,
         rng,
     )
+    validate_train_split(train_rows, dev_rows, args.sample_rate)
 
-    train_rows, dev_rows, train_dev_audit = split_train_dev(
+    output_dir = prepare_output_files(
+        args.output_dir,
+        ["train.csv", "dev.csv", "recording_split.csv"],
+        args.overwrite,
+    )
+    write_csv(output_dir / "train.csv", train_rows)
+    write_csv(output_dir / "dev.csv", dev_rows)
+    write_audit(output_dir / "recording_split.csv", audit_rows)
+
+    print("Train/validation manifests created")
+    print(f"  Speakers:     {len(speakers)}")
+    print(f"  Train chunks: {len(train_rows)}")
+    print(f"  Dev chunks:   {len(dev_rows)}")
+    print(f"  Output:        {output_dir}")
+
+
+def run_test(args: argparse.Namespace) -> None:
+    rng = random.Random(args.seed)
+    speakers = scan_dataset(args.data_root, args.sample_rate)
+    check_external_speakers(set(speakers), args.train_csv)
+
+    enrol_rows, test_rows, audit_rows = split_enrol_test(
         speakers,
-        training_speakers,
+        args,
         rng,
     )
-
-    enrol_rows, test_rows, verification_audit = split_enrol_test(
-        speakers,
-        verification_speakers,
-        rng,
-    )
-
-    recording_split_rows = train_dev_audit + verification_audit
-
     trials = create_trials(
         enrol_rows,
         test_rows,
         rng,
+        all_impostor_trials=args.all_impostor_trials,
     )
-
-    validate_split(
-        train_rows,
-        dev_rows,
+    validate_test_split(
         enrol_rows,
         test_rows,
-    )
-
-    # Delete old E0 manifests only after all new data passes validation.
-    reset_output_dir()
-
-    write_csv(OUTPUT_DIR / "train.csv", train_rows)
-    write_csv(OUTPUT_DIR / "dev.csv", dev_rows)
-    write_csv(OUTPUT_DIR / "enrol.csv", enrol_rows)
-    write_csv(OUTPUT_DIR / "test.csv", test_rows)
-    write_trials(
-        OUTPUT_DIR / "verification_trials.txt",
         trials,
-    )
-    write_recording_split(
-        OUTPUT_DIR / "recording_split.csv",
-        recording_split_rows,
+        args.sample_rate,
     )
 
-    print_summary(
-        speakers,
-        training_speakers,
-        verification_speakers,
-        train_rows,
-        dev_rows,
-        enrol_rows,
-        test_rows,
-        recording_split_rows,
-        trials,
+    output_dir = prepare_output_files(
+        args.output_dir,
+        [
+            "enrol.csv",
+            "test.csv",
+            "verification_trials.txt",
+            "recording_split.csv",
+        ],
+        args.overwrite,
     )
+    write_csv(output_dir / "enrol.csv", enrol_rows)
+    write_csv(output_dir / "test.csv", test_rows)
+    write_trials(output_dir / "verification_trials.txt", trials)
+    write_audit(output_dir / "recording_split.csv", audit_rows)
+
+    genuine = sum(label == 1 for label, _, _ in trials)
+    impostor = sum(label == 0 for label, _, _ in trials)
+    print("External-test manifests created")
+    print(f"  Speakers:         {len(speakers)}")
+    print(f"  Enrol recordings: {len(enrol_rows)}")
+    print(f"  Test recordings:  {len(test_rows)}")
+    print(f"  Genuine trials:   {genuine}")
+    print(f"  Impostor trials:  {impostor}")
+    print(f"  Output:            {output_dir}")
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        validate_args(args)
+        if args.command == "train":
+            run_train(args)
+        else:
+            run_test(args)
+        return 0
+    except Exception as exc:
+        print(
+            f"ERROR: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
