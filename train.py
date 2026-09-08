@@ -15,6 +15,11 @@ import torch
 from hyperpyyaml import load_hyperpyyaml
 from speechbrain.dataio import audio_io
 from speechbrain.utils.distributed import run_on_main
+from speechbrain.utils.epoch_loop import EpochCounterWithStopper
+
+
+DEFAULT_EARLY_STOPPING_PATIENCE = 3
+DEFAULT_EARLY_STOPPING_WARMUP = 1
 
 
 class SpeakerBrain(sb.Brain):
@@ -63,6 +68,11 @@ class SpeakerBrain(sb.Brain):
         stats["ErrorRate"] = self.error_metrics.summarize("average")
 
         if stage == sb.Stage.VALID:
+            # ErrorRate is minimized. Updating the counter once after every
+            # validation stage lets it stop the epoch loop when the metric has
+            # not improved for the configured number of epochs.
+            self.hparams.epoch_counter.update_metric(stats["ErrorRate"])
+
             self.hparams.train_logger.log_stats(
                 stats_meta={
                     "epoch": epoch,
@@ -138,6 +148,48 @@ def count_speakers(csv_path):
         return len({row["spk_id"] for row in csv.DictReader(file)})
 
 
+def configure_early_stopping(hparams):
+    """Replace the basic epoch counter with SpeechBrain's early stopper."""
+    current_counter = hparams["epoch_counter"]
+
+    if isinstance(current_counter, EpochCounterWithStopper):
+        return
+
+    patience = int(
+        hparams.get(
+            "early_stopping_patience",
+            DEFAULT_EARLY_STOPPING_PATIENCE,
+        )
+    )
+    warmup = int(
+        hparams.get(
+            "early_stopping_warmup",
+            DEFAULT_EARLY_STOPPING_WARMUP,
+        )
+    )
+
+    if patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1.")
+    if warmup < 0:
+        raise ValueError("early_stopping_warmup cannot be negative.")
+
+    epoch_counter = EpochCounterWithStopper(
+        limit=current_counter.limit,
+        limit_to_stop=patience,
+        limit_warmup=warmup,
+        direction="min",
+    )
+
+    hparams["epoch_counter"] = epoch_counter
+
+    # The YAML checkpointer was created with the original EpochCounter.
+    # Re-register the replacement so its early-stopping state is checkpointed.
+    hparams["checkpointer"].add_recoverable(
+        "counter",
+        epoch_counter,
+    )
+
+
 def best_available_device():
     """Choose MPS first, then CUDA, and finally CPU."""
     mps_backend = getattr(torch.backends, "mps", None)
@@ -201,6 +253,8 @@ if __name__ == "__main__":
 
     with open(hparams_file, encoding="utf-8") as file:
         hparams = load_hyperpyyaml(file, overrides)
+
+    configure_early_stopping(hparams)
 
     os.makedirs(hparams["save_folder"], exist_ok=True)
 
