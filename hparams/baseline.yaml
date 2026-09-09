@@ -1,50 +1,43 @@
-# Baseline E0 for MPS, CUDA, or CPU
-# Pretrained ECAPA-TDNN + fine-tuning
-# No VAD, no additive noise, no reverberation
+# ECAPA-TDNN fine-tuning with speaker-disjoint validation EER.
+#
+# IMPORTANT: this configuration is the contract for the validation-EER
+# training loop. The current train.py in the repository still validates with
+# closed-set classification ErrorRate and must be updated before this YAML is
+# used. In particular it must implement validation_trials.csv scoring, P x K
+# sampling, gradient accumulation, two optimizer parameter groups, cosine LR,
+# and mixed precision.
 
-seed: 42
+# Friend's deterministic sampler/model seed. The speaker split and validation
+# trials use 2026 in the reference implementation.
+seed: 20260729
+split_seed: 2026
+trial_seed: 2026
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 
-# Run train.py from the project root.
-manifest_folder: ./manifests/E0
+# ---------------------------------------------------------------------------
+# Paths produced by: python prepare_data.py train-eer ...
+# ---------------------------------------------------------------------------
+manifest_folder: ./manifests/train_val_eer
+train_annotation: !ref <manifest_folder>/train.csv
+validation_annotation: !ref <manifest_folder>/validation.csv
+validation_trials: !ref <manifest_folder>/validation_trials.csv
+speaker_split: !ref <manifest_folder>/speaker_split.csv
 
-# Use a new folder because the epoch-counter format differs from old runs.
-output_folder: ./results/E0_early_stopping
+output_folder: ./results/ECAPA_validation_EER
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
-train_annotation: !ref <manifest_folder>/train.csv
-valid_annotation: !ref <manifest_folder>/dev.csv
+# This must equal the unique spk_id count in train.csv. The friend's split has
+# 488 train speakers. Change it if your dataset produces a different count.
+out_n_neurons: 488
 
-# Must equal the number of unique spk_id values in train.csv.
-out_n_neurons: 9
-
+# ---------------------------------------------------------------------------
+# Audio and ECAPA architecture
+# ---------------------------------------------------------------------------
 sample_rate: 16000
-
-# number_of_epochs is the maximum. Training may stop earlier.
-number_of_epochs: 30
-early_stopping_patience: 5
-early_stopping_warmup: 2
-
-batch_size: 32
-learning_rate: 0.0001
-num_workers: 0
-
-train_dataloader_options:
-    batch_size: !ref <batch_size>
-    shuffle: True
-    num_workers: !ref <num_workers>
-    pin_memory: False
-    drop_last: True
-
-valid_dataloader_options:
-    batch_size: !ref <batch_size>
-    shuffle: False
-    num_workers: !ref <num_workers>
-    pin_memory: False
-    drop_last: False
-
+chunk_seconds: 3.0
 n_mels: 80
+embedding_dim: 192
 
 compute_features: !new:speechbrain.lobes.features.Fbank
     n_mels: !ref <n_mels>
@@ -53,18 +46,16 @@ mean_var_norm: !new:speechbrain.processing.features.InputNormalization
     norm_type: sentence
     std_norm: False
 
-# Must match speechbrain/spkrec-ecapa-voxceleb.
 embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
     input_size: !ref <n_mels>
     channels: [1024, 1024, 1024, 1024, 3072]
     kernel_sizes: [5, 3, 3, 3, 1]
     dilations: [1, 2, 3, 4, 1]
     attention_channels: 128
-    lin_neurons: 192
+    lin_neurons: !ref <embedding_dim>
 
-# New classifier for speakers in train.csv.
 classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
-    input_size: 192
+    input_size: !ref <embedding_dim>
     out_neurons: !ref <out_n_neurons>
 
 modules:
@@ -73,24 +64,115 @@ modules:
     embedding_model: !ref <embedding_model>
     classifier: !ref <classifier>
 
+# Full ECAPA fine-tuning, while preserving the pretrained normalizer and BN
+# running statistics. BN affine weights may still be trained.
+freeze_embedding_model: False
+freeze_mean_var_norm: True
+freeze_batchnorm_running_stats: True
+train_batchnorm_affine: True
+# The friend's run consumes cached Fbank tensors of shape [301, 80]. Keep this
+# flag False until the repository has a compatible cache-building stage.
+cache_fbank: False
+reference_cached_fbank_shape: [301, 80]
+
+# ---------------------------------------------------------------------------
+# AAM-Softmax head
+# ---------------------------------------------------------------------------
+aam_margin: 0.2
+aam_scale: 30.0
+aam_bias: null
+
 compute_cost: !new:speechbrain.nnet.losses.LogSoftmaxWrapper
     loss_fn: !new:speechbrain.nnet.losses.AdditiveAngularMargin
-        margin: 0.2
-        scale: 30
+        margin: !ref <aam_margin>
+        scale: !ref <aam_scale>
 
-error_stats: !name:speechbrain.utils.metric_stats.MetricStats
-    metric: !name:speechbrain.nnet.losses.classification_error
-        reduction: batch
+# ---------------------------------------------------------------------------
+# P x K sampling and memory setup
+# Friend: P=16 speakers, K=2 utterances => logical batch 32.
+# GPU processes microbatches of 4 and updates after 8 microbatches.
+# ---------------------------------------------------------------------------
+speakers_per_batch: 16
+utterances_per_speaker: 2
+logical_batch_size: 32
+microbatch_size: 4
+gradient_accumulation: 8
+effective_optimizer_batch: 32
+sampler_name: HybridShardAwareSpeakerBatchSampler
+sampler_seed: 20260729
+active_shard_window: 8
+num_workers: 2
 
-opt_class: !name:torch.optim.Adam
-    lr: !ref <learning_rate>
-    weight_decay: 0.000002
+# These options are used by the future P x K batch sampler. A plain shuffled
+# DataLoader is not equivalent to P x K sampling.
+train_dataloader_options:
+    batch_size: !ref <microbatch_size>
+    shuffle: False
+    num_workers: !ref <num_workers>
+    pin_memory: True
+    drop_last: True
 
-epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounterWithStopper
+validation_dataloader_options:
+    batch_size: 64
+    shuffle: False
+    num_workers: !ref <num_workers>
+    pin_memory: True
+    drop_last: False
+
+# ---------------------------------------------------------------------------
+# AdamW with two parameter groups
+# ---------------------------------------------------------------------------
+optimizer_name: AdamW
+ecapa_learning_rate: 0.00001
+aam_learning_rate: 0.001
+weight_decay: 0.0001
+
+# opt_class remains available to SpeechBrain, but train.py must create two
+# parameter groups so the encoder and AAM head receive their separate LRs.
+opt_class: !name:torch.optim.AdamW
+    lr: !ref <ecapa_learning_rate>
+    weight_decay: !ref <weight_decay>
+
+# ---------------------------------------------------------------------------
+# Cosine scheduler, matching the friend's 10 x 1,520 = 15,200 updates.
+# 1,520 is exact only when an epoch has 48,640 logical training examples.
+# train.py should validate/recompute this value if train.csv has another size.
+# ---------------------------------------------------------------------------
+scheduler_name: cosine_decay
+number_of_epochs: 10
+updates_per_epoch: 1520
+max_scheduler_updates: 15200
+warmup_updates: 0
+minimum_lr_factor: 0.1
+scheduler_step_unit: optimizer_update
+
+# ---------------------------------------------------------------------------
+# Validation EER and early stopping
+# ---------------------------------------------------------------------------
+validation_metric: EER
+early_stopping_mode: min
+early_stopping_patience: 2
+early_stopping_min_delta: 0.0001
+early_stopping_warmup: 0
+
+# Use the threshold found at validation EER for binary accept/reject reporting.
+threshold_source: validation_eer
+score_type: cosine_similarity
+
+# ---------------------------------------------------------------------------
+# Precision and checkpointing
+# ---------------------------------------------------------------------------
+use_amp: True
+ecapa_forward_precision: fp16
+aam_and_loss_precision: fp32
+grad_scaler_initial_scale: 128.0
+gradient_clipping: null
+checkpoint_every_updates: 100
+best_checkpoint_name: best.pt
+last_checkpoint_name: last.pt
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
-    limit_to_stop: !ref <early_stopping_patience>
-    limit_warmup: !ref <early_stopping_warmup>
-    direction: min
 
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
@@ -104,11 +186,11 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
         counter: !ref <epoch_counter>
 
 pretrained_folder: !ref <output_folder>/pretrained
-
-# Load the pretrained encoder only.
 pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
     collect_in: !ref <pretrained_folder>
     loadables:
         embedding_model: !ref <embedding_model>
+        mean_var_norm: !ref <mean_var_norm>
     paths:
         embedding_model: speechbrain/spkrec-ecapa-voxceleb/embedding_model.ckpt
+        mean_var_norm: speechbrain/spkrec-ecapa-voxceleb/mean_var_norm.ckpt
