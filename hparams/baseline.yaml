@@ -190,7 +190,5 @@ pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
     collect_in: !ref <pretrained_folder>
     loadables:
         embedding_model: !ref <embedding_model>
-        mean_var_norm: !ref <mean_var_norm>
     paths:
         embedding_model: speechbrain/spkrec-ecapa-voxceleb/embedding_model.ckpt
-        mean_var_norm: speechbrain/spkrec-ecapa-voxceleb/mean_var_norm.ckpt
